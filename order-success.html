@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Order Successful — Designtub</title>
+<style>
+  body{font-family:sans-serif;background:#f7f7f6;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px;}
+  .box{background:#fff;border-radius:20px;padding:40px 30px;text-align:center;max-width:420px;box-shadow:0 10px 30px rgba(0,0,0,0.08);}
+  .icon{width:64px;height:64px;border-radius:50%;background:#1e8e3e;color:#fff;display:flex;align-items:center;justify-content:center;margin:0 auto 18px;font-size:2rem;}
+  h1{font-size:1.3rem;color:#111;margin-bottom:10px;}
+  p{color:#6e6e6e;font-size:0.95rem;margin-bottom:20px;}
+  a{display:inline-block;padding:12px 26px;border-radius:12px;background:#111;color:#fff;text-decoration:none;font-weight:600;}
+</style>
+</head>
+<body>
+  <div class="box">
+    <div class="icon">✓</div>
+    <h1>Your order has been placed!</h1>
+    <p id="orderMsg">Thank you for shopping with Designtub.</p>
+    <a href="index.html">Continue Shopping</a>
+  </div>
+
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const orderId = params.get('orderId');
+    if(orderId){
+      document.getElementById('orderMsg').textContent = 'Order ID: ' + orderId + ' — Thank you for shopping with Designtub.';
+    }
+  </script>
+</body>
+</html>
