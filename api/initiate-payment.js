@@ -4,19 +4,15 @@
 
 const admin = require('firebase-admin');
 
-// ---------- Firebase Admin init (শুধু একবার) ----------
+// Firebase Admin init (JSON String ব্যবহার করে)
 if (!admin.apps.length) {
+  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  
   admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      // Vercel env var-এ \n literal থাকে, তাই replace করা হচ্ছে
-      privateKey: process.env.FIREBASE_PRIVATE_KEY 
-  ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n') 
-  : undefined,
-    }),
+    credential: admin.credential.cert(serviceAccount)
   });
 }
+
 const db = admin.firestore();
 
 const IS_SANDBOX = process.env.SSLCZ_IS_SANDBOX !== 'false'; // ডিফল্ট sandbox
