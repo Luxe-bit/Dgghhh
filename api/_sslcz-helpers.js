@@ -1,0 +1,66 @@
+// /api/_sslcz-helpers.js
+// শেয়ার্ড হেল্পার — success.js, ipn.js দুটোই এটা ব্যবহার করবে
+// ফাইলের নামের শুরুতে আন্ডারস্কোর (_) থাকায় Vercel এটাকে আলাদা route হিসেবে গণ্য করবে না
+
+const admin = require('firebase-admin');
+
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert({
+      projectId: process.env.FIREBASE_PROJECT_ID,
+      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+      privateKey: (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
+    }),
+  });
+}
+const db = admin.firestore();
+
+const IS_SANDBOX = process.env.SSLCZ_IS_SANDBOX !== 'false';
+const SSLCZ_BASE = IS_SANDBOX
+  ? 'https://sandbox.sslcommerz.com'
+  : 'https://securepay.sslcommerz.com';
+
+/**
+ * SSLCommerz-এর কাছে val_id দিয়ে সত্যতা যাচাই করে (spoofed POST ঠেকানোর জন্য এটা বাধ্যতামূলক)
+ */
+async function validateTransaction(valId) {
+  const params = new URLSearchParams({
+    val_id: valId,
+    store_id: process.env.SSLCZ_STORE_ID,
+    store_passwd: process.env.SSLCZ_STORE_PASSWORD,
+    v: '1',
+    format: 'json',
+  });
+  const url = `${SSLCZ_BASE}/validator/api/validationserverAPI.php?${params.toString()}`;
+  const response = await fetch(url);
+  return response.json();
+}
+
+/**
+ * যাচাই সফল হলে Firestore-এ payment_status: "Paid" করে দেয়।
+ * মূল অর্ডার status ("New") স্পর্শ করা হয় না, যাতে অ্যাডমিন প্যানেল ফ্লো অক্ষত থাকে।
+ */
+async function markOrderPaid(orderId, tranId, validationData) {
+  const orderRef = db.collection('orders').doc(orderId);
+  const snap = await orderRef.get();
+  if (!snap.exists) throw new Error('Order not found: ' + orderId);
+
+  const order = snap.data();
+  // একই অর্ডার দুইবার Paid না হয়ে যায় সেটা নিশ্চিত করা (duplicate IPN ঠেকানো)
+  if (order.payment_status === 'Paid') return { alreadyPaid: true };
+
+  await orderRef.set(
+    {
+      payment_status: 'Paid',
+      paymentGateway: 'SSLCommerz',
+      payment_verified_tran_id: tranId,
+      payment_card_type: validationData.card_type || null,
+      payment_bank_tran_id: validationData.bank_tran_id || null,
+      paidAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true }
+  );
+  return { alreadyPaid: false };
+}
+
+module.exports = { validateTransaction, markOrderPaid, db, admin };
