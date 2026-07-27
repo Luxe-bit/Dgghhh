@@ -1,29 +1,5 @@
 // /api/initiate-payment.js
-const admin = require('firebase-admin');
 const querystring = require('querystring');
-
-// Firebase Admin Init (১০০% নিরাপদ পদ্ধতি)
-let db = null;
-if (!admin.apps.length) {
-  try {
-    const rawAccount = process.env.FIREBASE_SERVICE_ACCOUNT;
-    if (rawAccount) {
-      // Vercel-এর সার্ভিস একাউন্ট পার্স করার একদম সঠিক ও সেফ ওয়ে
-      const serviceAccount = typeof rawAccount === 'string' 
-        ? JSON.parse(rawAccount.replace(/\\n/g, '\n')) 
-        : rawAccount;
-
-      admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
-      });
-      db = admin.firestore();
-    }
-  } catch (err) {
-    console.error('Firebase Admin init error in initiate-payment:', err.message);
-  }
-} else {
-  db = admin.firestore();
-}
 
 const IS_SANDBOX = process.env.SSLCZ_IS_SANDBOX !== 'false';
 const SSLCZ_BASE = IS_SANDBOX
@@ -49,6 +25,9 @@ async function parseBody(req) {
   });
 }
 
+// Firebase Project ID (আপনার প্রজেক্ট আইডি বসান অথবা Env থেকে নেবে)
+const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'designtub';
+
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -58,35 +37,43 @@ module.exports = async (req, res) => {
 
   try {
     const body = await parseBody(req);
-    const orderId = body.orderId;
+    const orderId = body ? body.orderId : null;
 
     if (!orderId) {
       return res.status(400).json({ error: 'orderId is required' });
     }
 
-    if (!db) {
-      return res.status(500).json({ error: 'Database connection failed. Check FIREBASE_SERVICE_ACCOUNT env' });
+    // Firestore REST API দিয়ে সরাসরি ডাটা রিড (No SDK Crash Risk)
+    const firestoreUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/orders/${orderId}`;
+    const fsResponse = await fetch(firestoreUrl);
+    
+    if (!fsResponse.ok) {
+      return res.status(404).json({ error: 'Order not found in Database' });
     }
 
-    // Firestore থেকে অর্ডার লোড
-    const orderRef = db.collection('orders').doc(orderId);
-    const orderSnap = await orderRef.get();
-    if (!orderSnap.exists) {
-      return res.status(404).json({ error: 'Order not found' });
-    }
+    const fsData = await fsResponse.json();
+    const fields = fsData.fields || {};
 
-    const order = orderSnap.data();
-
-    if (order.payment_status === 'Paid') {
+    // Extract Order Data Safely
+    const paymentStatus = fields.payment_status ? fields.payment_status.stringValue : '';
+    if (paymentStatus === 'Paid') {
       return res.status(400).json({ error: 'This order has already been paid' });
     }
 
-    const totalAmount = Number(order.totalPrice || order.total_amount || 0);
+    const totalPrice = fields.totalPrice ? Number(fields.totalPrice.doubleValue || fields.totalPrice.integerValue || 0) : 0;
+    const totalAmount = totalPrice || Number(fields.total_amount ? fields.total_amount.integerValue || fields.total_amount.doubleValue : 0);
+
     if (!totalAmount || totalAmount <= 0) {
       return res.status(400).json({ error: 'Invalid order amount' });
     }
 
-    const address = order.address || {};
+    const addressMap = fields.address ? (fields.address.mapValue ? fields.address.mapValue.fields : {}) : {};
+    const cusName = addressMap.name ? addressMap.name.stringValue : 'Customer';
+    const cusPhone = addressMap.phone ? addressMap.phone.stringValue : '01700000000';
+    const cusAdd = addressMap.address ? addressMap.address.stringValue : 'N/A';
+    const cusCity = addressMap.city ? addressMap.city.stringValue : 'Dhaka';
+    const cusEmail = fields.customerEmail ? fields.customerEmail.stringValue : 'customer@designtub.com';
+
     const tranId = `DTB-${orderId}-${Date.now()}`;
     const apiUrl = process.env.API_BASE_URL || 'https://dgghhh.vercel.app';
 
@@ -101,19 +88,19 @@ module.exports = async (req, res) => {
       cancel_url: `${apiUrl}/api/payment-cancel`,
       ipn_url: `${apiUrl}/api/payment-ipn`,
       shipping_method: 'Courier',
-      product_name: (order.items || []).map(i => i.name).join(', ').slice(0, 250) || 'Designtub Order',
+      product_name: 'Designtub Order',
       product_category: 'Ceramics',
       product_profile: 'general',
-      cus_name: address.name || 'Customer',
-      cus_email: order.customerEmail || 'noemail@designtub.com',
-      cus_add1: address.address || 'N/A',
-      cus_city: address.city || 'Dhaka',
+      cus_name: cusName,
+      cus_email: cusEmail,
+      cus_add1: cusAdd,
+      cus_city: cusCity,
       cus_postcode: '1000',
       cus_country: 'Bangladesh',
-      cus_phone: address.phone || '01700000000',
-      ship_name: address.name || 'Customer',
-      ship_add1: address.address || 'N/A',
-      ship_city: address.city || 'Dhaka',
+      cus_phone: cusPhone,
+      ship_name: cusName,
+      ship_add1: cusAdd,
+      ship_city: cusCity,
       ship_postcode: '1000',
       ship_country: 'Bangladesh',
       value_a: orderId,
@@ -125,20 +112,19 @@ module.exports = async (req, res) => {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: params.toString(),
     });
-    
+
     const sslczData = await sslczResponse.json();
 
     if (sslczData.status !== 'SUCCESS') {
-      console.error('SSLCommerz init failed:', sslczData);
-      return res.status(400).json({ error: 'Failed to initiate payment', details: sslczData });
+      console.error('SSLCommerz Error:', sslczData);
+      return res.status(400).json({ error: 'SSLCommerz initiation failed', details: sslczData });
     }
-
-    await orderRef.set({ payment_tran_id: tranId }, { merge: true });
 
     return res.status(200).json({ url: sslczData.GatewayPageURL });
 
   } catch (err) {
-    console.error('initiate-payment error:', err);
-    return res.status(500).json({ error: 'Internal server error', details: err.message });
+    console.error('Fatal initiate-payment Error:', err);
+    return res.status(500).json({ error: 'Server Internal Error', message: err.message });
   }
+};  }
 };
