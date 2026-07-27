@@ -21,7 +21,7 @@
     <a href="index.html">Back to Home</a>
   </div>
 
-  <script>
+ <script>
     const params = new URLSearchParams(window.location.search);
     const reason = params.get('reason');
     const orderId = params.get('orderId');
@@ -30,11 +30,14 @@
       payment_failed: 'The payment could not be processed.',
       invalid_transaction: 'We could not verify this transaction.',
       missing_data: 'Some required data was missing.',
-      server_error: 'A server error occurred. Please try again.'
+      server_error: 'A server error occurred. Please try again.',
+      order_not_found: 'We could not find this order.',
+      tran_id_mismatch: 'This payment could not be verified for your order. Please contact support.',
+      validation_unreachable: 'Could not verify payment right now. Please try again shortly.',
+      unauthorized_payment: 'This payment could not be verified. Please contact support.',
+      amount_mismatch: 'The paid amount did not match the order total. Please contact support.'
     };
     let text = messages[reason] || 'You can go back and try the payment again.';
     if(orderId) text += ' (Order ID: ' + orderId + ')';
     document.getElementById('failMsg').textContent = text;
-  </script>
-</body>
-</html>
+ </script>
