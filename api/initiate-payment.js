@@ -1,27 +1,30 @@
 // /api/initiate-payment.js
-// Vercel Serverless Function — SSLCommerz সেশন তৈরি করে GatewayPageURL রিটার্ন করে
-// ফায়ারবেসের existing order document (orders কালেকশন) থেকে ডাটা পড়ে, নতুন কিছু ওভাররাইট করে না
-
 const admin = require('firebase-admin');
 
-// Firebase Admin init (JSON String ব্যবহার করে)
+// Firebase Admin init (Safe Parse with Try-Catch)
 if (!admin.apps.length) {
-  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-  
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
-  });
+  try {
+    const rawAccount = process.env.FIREBASE_SERVICE_ACCOUNT;
+    if (rawAccount) {
+      const formattedAccount = rawAccount.replace(/\n/g, '\\n');
+      const serviceAccount = JSON.parse(formattedAccount);
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+      });
+    }
+  } catch (err) {
+    console.error('Firebase Admin init error in initiate-payment:', err.message);
+  }
 }
 
-const db = admin.firestore();
+const db = admin.apps.length ? admin.firestore() : null;
 
-const IS_SANDBOX = process.env.SSLCZ_IS_SANDBOX !== 'false'; // ডিফল্ট sandbox
+const IS_SANDBOX = process.env.SSLCZ_IS_SANDBOX !== 'false';
 const SSLCZ_BASE = IS_SANDBOX
   ? 'https://sandbox.sslcommerz.com'
   : 'https://securepay.sslcommerz.com';
 
 module.exports = async (req, res) => {
-  // CORS — আপনার GitHub Pages ডোমেইন থেকে কল করার জন্য
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -31,32 +34,28 @@ module.exports = async (req, res) => {
   try {
     const { orderId } = req.body;
     if (!orderId) return res.status(400).json({ error: 'orderId is required' });
+    if (!db) return res.status(500).json({ error: 'Database connection failed' });
 
-    // ---------- Firestore থেকে অর্ডারটি লোড ----------
+    // Firestore থেকে অর্ডার লোড
     const orderRef = db.collection('orders').doc(orderId);
     const orderSnap = await orderRef.get();
     if (!orderSnap.exists) return res.status(404).json({ error: 'Order not found' });
 
     const order = orderSnap.data();
 
-    // আগে থেকে Paid থাকলে দ্বিতীয়বার পেমেন্ট সেশন তৈরি করতে দেওয়া হবে না
     if (order.payment_status === 'Paid') {
       return res.status(400).json({ error: 'This order has already been paid' });
     }
 
-    // ইতিমধ্যে ক্যালকুলেট করা total amount ব্যবহার হচ্ছে — নতুন করে হিসাব করা হচ্ছে না
     const totalAmount = Number(order.totalPrice || order.total_amount || 0);
     if (!totalAmount || totalAmount <= 0) {
       return res.status(400).json({ error: 'Invalid order amount' });
     }
 
     const address = order.address || {};
-    // প্রতিটি পেমেন্ট এটেম্পটের জন্য ইউনিক transaction id
     const tranId = `DTB-${orderId}-${Date.now()}`;
 
-    // 🔴 সরাসরি আপনার ডোমেইন বসিয়ে দিন:
-const siteUrl = process.env.SITE_URL || 'https://luxe-bit.github.io/Dgghhh/'; 
-const apiUrl = process.env.API_BASE_URL || 'https://dgghhh.vercel.app';
+    const apiUrl = process.env.API_BASE_URL || 'https://dgghhh.vercel.app';
 
     const postData = {
       store_id: process.env.SSLCZ_STORE_ID,
@@ -84,7 +83,7 @@ const apiUrl = process.env.API_BASE_URL || 'https://dgghhh.vercel.app';
       ship_city: address.city || 'Dhaka',
       ship_postcode: '1000',
       ship_country: 'Bangladesh',
-      value_a: orderId, // orderId টা পরে callback-এ ফেরত পাওয়ার জন্য
+      value_a: orderId, // Callback-এ ফেরত পাওয়ার জন্য
     };
 
     const params = new URLSearchParams(postData);
@@ -100,7 +99,6 @@ const apiUrl = process.env.API_BASE_URL || 'https://dgghhh.vercel.app';
       return res.status(400).json({ error: 'Failed to initiate payment', details: sslczData });
     }
 
-    // tran_id-টা অর্ডারের সাথে রেখে দিচ্ছি, যাতে IPN/callback-এ ম্যাচ করা যায়
     await orderRef.set({ payment_tran_id: tranId }, { merge: true });
 
     return res.status(200).json({ url: sslczData.GatewayPageURL });
