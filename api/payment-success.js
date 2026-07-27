@@ -2,21 +2,28 @@
 const admin = require('firebase-admin');
 const querystring = require('querystring');
 
-// Firebase Admin Init
+// Firebase ইনিশিয়ালাইজেশনকে পুরোপুরি সুরক্ষিত (Crash-Proof) রাখা
+let db = null;
 if (!admin.apps.length) {
   try {
-    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount)
-    });
+    const rawAccount = process.env.FIREBASE_SERVICE_ACCOUNT;
+    if (rawAccount) {
+      // New line issue handle kora
+      const formattedAccount = rawAccount.replace(/\n/g, '\\n');
+      const serviceAccount = JSON.parse(formattedAccount);
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+      });
+      db = admin.firestore();
+    }
   } catch (err) {
-    console.error('Firebase init error in payment-success:', err);
+    console.error('Firebase init failed gracefully:', err.message);
   }
+} else {
+  db = admin.firestore();
 }
 
-const db = admin.apps.length ? admin.firestore() : null;
-
-// Form Body Parser for Vercel
+// Vercel Form-Body Parser
 async function parseFormBody(req) {
   if (req.body && typeof req.body === 'object') return req.body;
   return new Promise((resolve) => {
@@ -29,25 +36,29 @@ async function parseFormBody(req) {
 }
 
 module.exports = async (req, res) => {
+  // CORS Headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   const siteUrl = process.env.SITE_URL || 'https://luxe-bit.github.io/Dgghhh';
 
   try {
-    const body = await parseFormBody(req);
-    console.log('1. Payload Received:', JSON.stringify(body));
+    // Body Parse করা (GET/POST দুইটার জন্যই সেফ)
+    const body = (req.method === 'POST') ? await parseFormBody(req) : (req.query || {});
+    const val_id = body.val_id || req.query.val_id;
+    const tran_id = body.tran_id || req.query.tran_id;
+    const orderId = body.value_a || req.query.value_a || body.orderId || req.query.orderId;
 
-    const { val_id, tran_id, value_a: orderId } = body;
-
-    // ১. ডাটা চেক
+    // ১. প্রয়োজনীয় তথ্য মিসিং চেক
     if (!val_id || !orderId) {
-      console.error('ERROR: Missing val_id or orderId', { val_id, orderId });
+      console.log('Missing val_id or orderId in payload');
       return res.redirect(302, `${siteUrl}/order-fail.html?reason=missing_data`);
     }
 
-    // ২. SSLCommerz Validation URL
+    // ২. SSLCommerz Validation Call
     const isSandbox = process.env.SSLCZ_IS_SANDBOX !== 'false';
     const sslczBaseUrl = isSandbox 
       ? 'https://sandbox.sslcommerz.com' 
@@ -56,27 +67,23 @@ module.exports = async (req, res) => {
     const storeId = process.env.SSLCZ_STORE_ID;
     const storePass = process.env.SSLCZ_STORE_PASSWORD;
 
-    console.log('2. Validating with Store ID:', storeId);
-
     const validationUrl = `${sslczBaseUrl}/validator/api/validationserverAPI.php?val_id=${val_id}&store_id=${storeId}&store_passwd=${storePass}&v=1&format=json`;
 
-    // Fetch call with Try/Catch
     let valData = {};
     try {
-      const valResponse = await fetch(validationUrl);
-      valData = await valResponse.json();
-      console.log('3. SSLCommerz Response:', JSON.stringify(valData));
-    } catch (fetchErr) {
-      console.error('Fetch to SSLCommerz failed:', fetchErr);
+      const response = await fetch(validationUrl);
+      valData = await response.json();
+    } catch (fErr) {
+      console.error('SSLCommerz fetch error:', fErr);
     }
 
-    // পেমেন্ট স্ট্যাটাস চেক
+    // পেমেন্ট আসল নাকি ভুয়া চেক
     if (valData.status !== 'VALID' && valData.status !== 'VALIDATED') {
-      console.error('4. Validation Failed! Status:', valData.status);
+      console.log('Validation status not valid:', valData.status);
       return res.redirect(302, `${siteUrl}/order-fail.html?reason=unauthorized_payment`);
     }
 
-    // ৩. Firestore Update
+    // ৩. Firestore Update (Firebase ঠিক থাকলে আপডেট করবে)
     if (db) {
       try {
         await db.collection('orders').doc(orderId).set({
@@ -87,17 +94,17 @@ module.exports = async (req, res) => {
           paid_amount: valData.amount || 0,
           paidAt: new Date().toISOString()
         }, { merge: true });
-        console.log('5. Firebase Order Updated Successfully!');
       } catch (dbErr) {
-        console.error('Firebase update error:', dbErr);
+        console.error('Firestore doc update failed:', dbErr);
       }
     }
 
-    // ৪. Redirect
+    // ৪. Success পেজে রিডাইরেক্ট
     return res.redirect(302, `${siteUrl}/order-success.html?orderId=${encodeURIComponent(orderId)}`);
 
   } catch (err) {
-    console.error('CRITICAL SERVER ERROR:', err);
+    console.error('Unhandled Server Exception:', err);
+    // কোনো জটিল এরর হলেও সার্ভার ৫০০ মারবে না, সেফলি রিডাইরেক্ট করবে
     return res.redirect(302, `${siteUrl}/order-fail.html?reason=server_error`);
   }
 };
