@@ -1,6 +1,4 @@
 // /api/payment-success.js
-// Production-Ready & Secure Payment Validation for SSLCommerz
-
 const admin = require('firebase-admin');
 const querystring = require('querystring');
 
@@ -18,7 +16,7 @@ if (!admin.apps.length) {
 
 const db = admin.apps.length ? admin.firestore() : null;
 
-// Form Body Parser for Serverless Environment
+// Form Body Parser for Vercel
 async function parseFormBody(req) {
   if (req.body && typeof req.body === 'object') return req.body;
   return new Promise((resolve) => {
@@ -39,48 +37,67 @@ module.exports = async (req, res) => {
 
   try {
     const body = await parseFormBody(req);
+    console.log('1. Payload Received:', JSON.stringify(body));
+
     const { val_id, tran_id, value_a: orderId } = body;
 
-    // ১. প্রয়োজনীয় তথ্য অনুপস্থিত থাকলে Fail পেজে পাঠানো
+    // ১. ডাটা চেক
     if (!val_id || !orderId) {
-      console.error('Missing val_id or orderId in callback payload');
+      console.error('ERROR: Missing val_id or orderId', { val_id, orderId });
       return res.redirect(302, `${siteUrl}/order-fail.html?reason=missing_data`);
     }
 
-    // ২. SSLCommerz Server-to-Server Validation (নিরাপত্তার আসল অংশ)
+    // ২. SSLCommerz Validation URL
     const isSandbox = process.env.SSLCZ_IS_SANDBOX !== 'false';
     const sslczBaseUrl = isSandbox 
       ? 'https://sandbox.sslcommerz.com' 
       : 'https://securepay.sslcommerz.com';
 
-    const validationUrl = `${sslczBaseUrl}/validator/api/validationserverAPI.php?val_id=${val_id}&store_id=${process.env.SSLCZ_STORE_ID}&store_passwd=${process.env.SSLCZ_STORE_PASSWORD}&v=1&format=json`;
+    const storeId = process.env.SSLCZ_STORE_ID;
+    const storePass = process.env.SSLCZ_STORE_PASSWORD;
 
-    const valResponse = await fetch(validationUrl);
-    const valData = await valResponse.json();
+    console.log('2. Validating with Store ID:', storeId);
 
-    // টাকা সত্যি জমা হয়েছে কি না যাচাই
+    const validationUrl = `${sslczBaseUrl}/validator/api/validationserverAPI.php?val_id=${val_id}&store_id=${storeId}&store_passwd=${storePass}&v=1&format=json`;
+
+    // Fetch call with Try/Catch
+    let valData = {};
+    try {
+      const valResponse = await fetch(validationUrl);
+      valData = await valResponse.json();
+      console.log('3. SSLCommerz Response:', JSON.stringify(valData));
+    } catch (fetchErr) {
+      console.error('Fetch to SSLCommerz failed:', fetchErr);
+    }
+
+    // পেমেন্ট স্ট্যাটাস চেক
     if (valData.status !== 'VALID' && valData.status !== 'VALIDATED') {
-      console.error('SSLCommerz payment validation failed:', valData.status);
+      console.error('4. Validation Failed! Status:', valData.status);
       return res.redirect(302, `${siteUrl}/order-fail.html?reason=unauthorized_payment`);
     }
 
-    // ৩. আসল পেমেন্ট নিশ্চিত হলে কেবল তখনই Firebase Database আপডেট হবে
+    // ৩. Firestore Update
     if (db) {
-      await db.collection('orders').doc(orderId).set({
-        payment_status: 'Paid',
-        payment_method: valData.card_type || 'SSLCommerz',
-        payment_tran_id: tran_id,
-        val_id: val_id,
-        paid_amount: valData.amount,
-        paidAt: new Date().toISOString()
-      }, { merge: true });
+      try {
+        await db.collection('orders').doc(orderId).set({
+          payment_status: 'Paid',
+          payment_method: valData.card_type || 'SSLCommerz',
+          payment_tran_id: tran_id,
+          val_id: val_id,
+          paid_amount: valData.amount || 0,
+          paidAt: new Date().toISOString()
+        }, { merge: true });
+        console.log('5. Firebase Order Updated Successfully!');
+      } catch (dbErr) {
+        console.error('Firebase update error:', dbErr);
+      }
     }
 
-    // ৪. কাস্টমারকে আসল Success পেজে পাঠানো
+    // ৪. Redirect
     return res.redirect(302, `${siteUrl}/order-success.html?orderId=${encodeURIComponent(orderId)}`);
 
   } catch (err) {
-    console.error('Server error in payment-success:', err);
+    console.error('CRITICAL SERVER ERROR:', err);
     return res.redirect(302, `${siteUrl}/order-fail.html?reason=server_error`);
   }
 };
