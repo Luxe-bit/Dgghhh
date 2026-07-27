@@ -1,109 +1,123 @@
-// /api/initiate-payment.js
-const admin = require('firebase-admin');
+// /api/payment-success.js
+const querystring = require('querystring');
+const { getDb } = require('./_lib/firebaseAdmin');
 
-// Firebase Admin init (Safe Parse with Try-Catch)
-if (!admin.apps.length) {
+const siteUrl = process.env.SITE_URL || 'https://luxe-bit.github.io/Dgghhh';
+
+async function parseFormBody(req) {
+  if (req.body && typeof req.body === 'object') return req.body;
+  return new Promise((resolve) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk.toString(); });
+    req.on('end', () => resolve(querystring.parse(body)));
+  });
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const rawAccount = process.env.FIREBASE_SERVICE_ACCOUNT;
-    if (rawAccount) {
-      const formattedAccount = rawAccount.replace(/\n/g, '\\n');
-      const serviceAccount = JSON.parse(formattedAccount);
-      admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
-      });
-    }
-  } catch (err) {
-    console.error('Firebase Admin init error in initiate-payment:', err.message);
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(t);
   }
 }
 
-const db = admin.apps.length ? admin.firestore() : null;
-
-const IS_SANDBOX = process.env.SSLCZ_IS_SANDBOX !== 'false';
-const SSLCZ_BASE = IS_SANDBOX
-  ? 'https://sandbox.sslcommerz.com'
-  : 'https://securepay.sslcommerz.com';
-
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(200).end();
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   try {
-    const { orderId } = req.body;
-    if (!orderId) return res.status(400).json({ error: 'orderId is required' });
-    if (!db) return res.status(500).json({ error: 'Database connection failed' });
+    const body = (req.method === 'POST') ? await parseFormBody(req) : (req.query || {});
 
-    // Firestore থেকে অর্ডার লোড
-    const orderRef = db.collection('orders').doc(orderId);
+    const val_id = body.val_id || req.query.val_id;
+    const tran_id = body.tran_id || req.query.tran_id;
+    const orderId = body.value_a || req.query.value_a || body.orderId || req.query.orderId;
+
+    if (!val_id || !orderId || !tran_id) {
+      console.error('Missing val_id/tran_id/orderId:', { val_id, tran_id, orderId });
+      return res.redirect(302, `${siteUrl}/order-fail.html?reason=missing_data`);
+    }
+
+    const db = getDb();
+    const orderRef = db.collection('orders').doc(String(orderId));
     const orderSnap = await orderRef.get();
-    if (!orderSnap.exists) return res.status(404).json({ error: 'Order not found' });
+
+    if (!orderSnap.exists) {
+      console.error('Order not found for id:', orderId);
+      return res.redirect(302, `${siteUrl}/order-fail.html?reason=order_not_found`);
+    }
 
     const order = orderSnap.data();
 
+    // Idempotency: if a duplicate callback/IPN arrives after we already
+    // marked this Paid, don't re-validate or re-charge logic — just show success.
     if (order.payment_status === 'Paid') {
-      return res.status(400).json({ error: 'This order has already been paid' });
+      return res.redirect(302, `${siteUrl}/order-success.html?orderId=${encodeURIComponent(orderId)}`);
     }
 
-    const totalAmount = Number(order.totalPrice || order.total_amount || 0);
-    if (!totalAmount || totalAmount <= 0) {
-      return res.status(400).json({ error: 'Invalid order amount' });
+    // Anti-tamper: the tran_id in this callback must match the one we
+    // generated and stored when initiating payment for THIS order.
+    if (order.payment_tran_id !== tran_id) {
+      console.error('tran_id mismatch for order', orderId, { expected: order.payment_tran_id, got: tran_id });
+      return res.redirect(302, `${siteUrl}/order-fail.html?reason=tran_id_mismatch`);
     }
 
-    const address = order.address || {};
-    const tranId = `DTB-${orderId}-${Date.now()}`;
+    // ---- Server-to-server validation with SSLCommerz ----
+    const isSandbox = process.env.SSLCZ_IS_SANDBOX !== 'false';
+    const sslczBaseUrl = isSandbox
+      ? 'https://sandbox.sslcommerz.com'
+      : 'https://securepay.sslcommerz.com';
 
-    const apiUrl = process.env.API_BASE_URL || 'https://dgghhh.vercel.app';
+    const storeId = process.env.SSLCZ_STORE_ID;
+    const storePass = process.env.SSLCZ_STORE_PASSWORD;
+    const validationUrl = `${sslczBaseUrl}/validator/api/validationserverAPI.php?val_id=${encodeURIComponent(val_id)}&store_id=${encodeURIComponent(storeId)}&store_passwd=${encodeURIComponent(storePass)}&v=1&format=json`;
 
-    const postData = {
-      store_id: process.env.SSLCZ_STORE_ID,
-      store_passwd: process.env.SSLCZ_STORE_PASSWORD,
-      total_amount: totalAmount,
-      currency: 'BDT',
-      tran_id: tranId,
-      success_url: `${apiUrl}/api/payment-success`,
-      fail_url: `${apiUrl}/api/payment-fail`,
-      cancel_url: `${apiUrl}/api/payment-cancel`,
-      ipn_url: `${apiUrl}/api/payment-ipn`,
-      shipping_method: 'Courier',
-      product_name: (order.items || []).map(i => i.name).join(', ').slice(0, 250) || 'Designtub Order',
-      product_category: 'Ceramics',
-      product_profile: 'general',
-      cus_name: address.name || 'Customer',
-      cus_email: order.customerEmail || 'noemail@designtub.com',
-      cus_add1: address.address || 'N/A',
-      cus_city: address.city || 'Dhaka',
-      cus_postcode: '1000',
-      cus_country: 'Bangladesh',
-      cus_phone: address.phone || '01700000000',
-      ship_name: address.name || 'Customer',
-      ship_add1: address.address || 'N/A',
-      ship_city: address.city || 'Dhaka',
-      ship_postcode: '1000',
-      ship_country: 'Bangladesh',
-      value_a: orderId, // Callback-এ ফেরত পাওয়ার জন্য
-    };
-
-    const params = new URLSearchParams(postData);
-    const sslczResponse = await fetch(`${SSLCZ_BASE}/gwprocess/v4/api.php`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: params.toString(),
-    });
-    const sslczData = await sslczResponse.json();
-
-    if (sslczData.status !== 'SUCCESS') {
-      console.error('SSLCommerz init failed:', sslczData);
-      return res.status(400).json({ error: 'Failed to initiate payment', details: sslczData });
+    let valData;
+    try {
+      const response = await fetchWithTimeout(validationUrl, {}, 10000);
+      valData = await response.json();
+    } catch (fErr) {
+      console.error('SSLCommerz validation request failed/timed out:', fErr.message);
+      return res.redirect(302, `${siteUrl}/order-fail.html?reason=validation_unreachable`);
     }
 
-    await orderRef.set({ payment_tran_id: tranId }, { merge: true });
+    if (valData.status !== 'VALID' && valData.status !== 'VALIDATED') {
+      console.error('Validation failed, status:', valData.status, valData);
+      return res.redirect(302, `${siteUrl}/order-fail.html?reason=unauthorized_payment`);
+    }
 
-    return res.status(200).json({ url: sslczData.GatewayPageURL });
+    // Anti-tamper: confirm the tran_id inside the *validated* SSLCommerz
+    // response also matches (not just the query param), and the paid
+    // amount matches what we expected when initiating.
+    if (valData.tran_id && valData.tran_id !== order.payment_tran_id) {
+      console.error('Validated tran_id mismatch for order', orderId);
+      return res.redirect(302, `${siteUrl}/order-fail.html?reason=tran_id_mismatch`);
+    }
+
+    const paidAmount = Number(valData.amount || 0);
+    const expectedAmount = Number(order.expected_amount || 0);
+    if (!expectedAmount || Math.abs(paidAmount - expectedAmount) > 1) {
+      console.error('Amount mismatch for order', orderId, { paidAmount, expectedAmount });
+      return res.redirect(302, `${siteUrl}/order-fail.html?reason=amount_mismatch`);
+    }
+
+    // ---- All checks passed: mark Paid ----
+    await orderRef.set({
+      payment_status: 'Paid',
+      payment_method: valData.card_type || 'SSLCommerz',
+      payment_tran_id: tran_id,
+      val_id: val_id,
+      paid_amount: paidAmount,
+      paidAt: new Date().toISOString(),
+    }, { merge: true });
+
+    return res.redirect(302, `${siteUrl}/order-success.html?orderId=${encodeURIComponent(orderId)}`);
+
   } catch (err) {
-    console.error('initiate-payment error:', err);
-    return res.status(500).json({ error: 'Internal server error' });
+    console.error('Unhandled Exception in payment-success:', err);
+    return res.redirect(302, `${siteUrl}/order-fail.html?reason=server_error`);
   }
 };
