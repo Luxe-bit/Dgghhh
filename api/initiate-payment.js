@@ -1,28 +1,53 @@
 // /api/initiate-payment.js
 const admin = require('firebase-admin');
+const querystring = require('querystring');
 
-// Firebase Admin init (Safe Parse with Try-Catch)
+// Firebase Admin Init (১০০% নিরাপদ পদ্ধতি)
+let db = null;
 if (!admin.apps.length) {
   try {
     const rawAccount = process.env.FIREBASE_SERVICE_ACCOUNT;
     if (rawAccount) {
-      const formattedAccount = rawAccount.replace(/\n/g, '\\n');
-      const serviceAccount = JSON.parse(formattedAccount);
+      // Vercel-এর সার্ভিস একাউন্ট পার্স করার একদম সঠিক ও সেফ ওয়ে
+      const serviceAccount = typeof rawAccount === 'string' 
+        ? JSON.parse(rawAccount.replace(/\\n/g, '\n')) 
+        : rawAccount;
+
       admin.initializeApp({
         credential: admin.credential.cert(serviceAccount)
       });
+      db = admin.firestore();
     }
   } catch (err) {
     console.error('Firebase Admin init error in initiate-payment:', err.message);
   }
+} else {
+  db = admin.firestore();
 }
-
-const db = admin.apps.length ? admin.firestore() : null;
 
 const IS_SANDBOX = process.env.SSLCZ_IS_SANDBOX !== 'false';
 const SSLCZ_BASE = IS_SANDBOX
   ? 'https://sandbox.sslcommerz.com'
   : 'https://securepay.sslcommerz.com';
+
+// Vercel Body Parser Helper
+async function parseBody(req) {
+  if (req.body && typeof req.body === 'object') return req.body;
+  if (typeof req.body === 'string') {
+    try { return JSON.parse(req.body); } catch(e) {}
+  }
+  return new Promise((resolve) => {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(body));
+      } catch (e) {
+        resolve(querystring.parse(body));
+      }
+    });
+  });
+}
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -32,14 +57,23 @@ module.exports = async (req, res) => {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   try {
-    const { orderId } = req.body;
-    if (!orderId) return res.status(400).json({ error: 'orderId is required' });
-    if (!db) return res.status(500).json({ error: 'Database connection failed' });
+    const body = await parseBody(req);
+    const orderId = body.orderId;
+
+    if (!orderId) {
+      return res.status(400).json({ error: 'orderId is required' });
+    }
+
+    if (!db) {
+      return res.status(500).json({ error: 'Database connection failed. Check FIREBASE_SERVICE_ACCOUNT env' });
+    }
 
     // Firestore থেকে অর্ডার লোড
     const orderRef = db.collection('orders').doc(orderId);
     const orderSnap = await orderRef.get();
-    if (!orderSnap.exists) return res.status(404).json({ error: 'Order not found' });
+    if (!orderSnap.exists) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
 
     const order = orderSnap.data();
 
@@ -54,7 +88,6 @@ module.exports = async (req, res) => {
 
     const address = order.address || {};
     const tranId = `DTB-${orderId}-${Date.now()}`;
-
     const apiUrl = process.env.API_BASE_URL || 'https://dgghhh.vercel.app';
 
     const postData = {
@@ -83,7 +116,7 @@ module.exports = async (req, res) => {
       ship_city: address.city || 'Dhaka',
       ship_postcode: '1000',
       ship_country: 'Bangladesh',
-      value_a: orderId, // Callback-এ ফেরত পাওয়ার জন্য
+      value_a: orderId,
     };
 
     const params = new URLSearchParams(postData);
@@ -92,6 +125,7 @@ module.exports = async (req, res) => {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: params.toString(),
     });
+    
     const sslczData = await sslczResponse.json();
 
     if (sslczData.status !== 'SUCCESS') {
@@ -102,8 +136,9 @@ module.exports = async (req, res) => {
     await orderRef.set({ payment_tran_id: tranId }, { merge: true });
 
     return res.status(200).json({ url: sslczData.GatewayPageURL });
+
   } catch (err) {
     console.error('initiate-payment error:', err);
-    return res.status(500).json({ error: 'Internal server error' });
+    return res.status(500).json({ error: 'Internal server error', details: err.message });
   }
 };
