@@ -1,19 +1,14 @@
 // /api/_sslcz-helpers.js
-// শেয়ার্ড হেল্পার — success.js, ipn.js দুটোই এটা ব্যবহার করবে
+// শেয়ার্ড হেল্পার — যেকোনো ফাইল (যেমন payment-ipn.js) এটা ব্যবহার করতে পারে
 // ফাইলের নামের শুরুতে আন্ডারস্কোর (_) থাকায় Vercel এটাকে আলাদা route হিসেবে গণ্য করবে না
+//
+// NOTE: এখন এটা আলাদা করে Firebase init করে না — firebaseAdmin.js এর
+// getDb() ব্যবহার করে, যাতে পুরো প্রজেক্টে একটাই init path থাকে
+// (env var মিসম্যাচ বা load-order এর উপর নির্ভর করার ঝুঁকি থাকে না)
 
-const admin = require('firebase-admin');
+const { admin, getDb } = require('./_lib/firebaseAdmin');
 
-if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: (process.env.FIREBASE_PRIVATE_KEY || '').replace(/\\n/g, '\n'),
-    }),
-  });
-}
-const db = admin.firestore();
+const db = getDb();
 
 const IS_SANDBOX = process.env.SSLCZ_IS_SANDBOX !== 'false';
 const SSLCZ_BASE = IS_SANDBOX
