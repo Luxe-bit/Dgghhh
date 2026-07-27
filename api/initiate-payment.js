@@ -54,8 +54,9 @@ module.exports = async (req, res) => {
     // প্রতিটি পেমেন্ট এটেম্পটের জন্য ইউনিক transaction id
     const tranId = `DTB-${orderId}-${Date.now()}`;
 
-    const siteUrl = process.env.SITE_URL; // যেমন: https://yourdomain.com
-    const apiUrl = process.env.API_BASE_URL; // যেমন: https://your-vercel-app.vercel.app
+    // 🔴 সরাসরি আপনার ডোমেইন বসিয়ে দিন:
+const siteUrl = process.env.SITE_URL || 'https://luxe-bit.github.io/Dgghhh/'; 
+const apiUrl = process.env.API_BASE_URL || 'https://dgghhh.vercel.app';
 
     const postData = {
       store_id: process.env.SSLCZ_STORE_ID,
