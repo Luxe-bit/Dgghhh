@@ -1,20 +1,20 @@
 // /api/initiate-payment.js
 const querystring = require('querystring');
+const { getDb } = require('./_lib/firebaseAdmin');
 
 const IS_SANDBOX = process.env.SSLCZ_IS_SANDBOX !== 'false';
 const SSLCZ_BASE = IS_SANDBOX
   ? 'https://sandbox.sslcommerz.com'
   : 'https://securepay.sslcommerz.com';
 
-// Vercel Body Parser Helper
 async function parseBody(req) {
   if (req.body && typeof req.body === 'object') return req.body;
   if (typeof req.body === 'string') {
-    try { return JSON.parse(req.body); } catch(e) {}
+    try { return JSON.parse(req.body); } catch (e) { /* fall through */ }
   }
   return new Promise((resolve) => {
     let body = '';
-    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('data', (chunk) => { body += chunk.toString(); });
     req.on('end', () => {
       try {
         resolve(JSON.parse(body));
@@ -25,8 +25,17 @@ async function parseBody(req) {
   });
 }
 
-// Firebase Project ID (আপনার প্রজেক্ট আইডি বসান অথবা Env থেকে নেবে)
-const PROJECT_ID = process.env.FIREBASE_PROJECT_ID || 'designtub';
+// fetch() with a hard timeout so a slow SSLCommerz response can't hang
+// the serverless function until Vercel kills it.
+async function fetchWithTimeout(url, options = {}, timeoutMs = 10000) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -36,44 +45,50 @@ module.exports = async (req, res) => {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   try {
-    const body = await parseBody(req);
-    const orderId = body ? body.orderId : null;
+    // ---- required env vars, fail fast with a clear message ----
+    const required = ['FIREBASE_SERVICE_ACCOUNT', 'SSLCZ_STORE_ID', 'SSLCZ_STORE_PASSWORD'];
+    const missing = required.filter((k) => !process.env[k]);
+    if (missing.length) {
+      console.error('Missing env vars:', missing.join(', '));
+      return res.status(500).json({ error: 'Server misconfigured', missing });
+    }
 
+    const body = await parseBody(req);
+    const orderId = body ? String(body.orderId || '').trim() : '';
     if (!orderId) {
       return res.status(400).json({ error: 'orderId is required' });
     }
 
-    // Firestore REST API দিয়ে সরাসরি ডাটা রিড (No SDK Crash Risk)
-    const firestoreUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/orders/${orderId}`;
-    const fsResponse = await fetch(firestoreUrl);
-    
-    if (!fsResponse.ok) {
+    // ---- Read order via Admin SDK (bypasses security rules — no public read needed) ----
+    const db = getDb();
+    const orderRef = db.collection('orders').doc(orderId);
+    const orderSnap = await orderRef.get();
+
+    if (!orderSnap.exists) {
       return res.status(404).json({ error: 'Order not found in Database' });
     }
 
-    const fsData = await fsResponse.json();
-    const fields = fsData.fields || {};
+    const order = orderSnap.data();
 
-    // Extract Order Data Safely
-    const paymentStatus = fields.payment_status ? fields.payment_status.stringValue : '';
-    if (paymentStatus === 'Paid') {
+    if (order.payment_status === 'Paid') {
       return res.status(400).json({ error: 'This order has already been paid' });
     }
 
-    const totalPrice = fields.totalPrice ? Number(fields.totalPrice.doubleValue || fields.totalPrice.integerValue || 0) : 0;
-    const totalAmount = totalPrice || Number(fields.total_amount ? fields.total_amount.integerValue || fields.total_amount.doubleValue : 0);
-
-    if (!totalAmount || totalAmount <= 0) {
+    const totalAmount = Number(order.totalPrice ?? order.total_amount ?? 0);
+    if (!totalAmount || totalAmount <= 0 || !Number.isFinite(totalAmount)) {
       return res.status(400).json({ error: 'Invalid order amount' });
     }
 
-    const addressMap = fields.address ? (fields.address.mapValue ? fields.address.mapValue.fields : {}) : {};
-    const cusName = addressMap.name ? addressMap.name.stringValue : 'Customer';
-    const cusPhone = addressMap.phone ? addressMap.phone.stringValue : '01700000000';
-    const cusAdd = addressMap.address ? addressMap.address.stringValue : 'N/A';
-    const cusCity = addressMap.city ? addressMap.city.stringValue : 'Dhaka';
-    const cusEmail = fields.customerEmail ? fields.customerEmail.stringValue : 'customer@designtub.com';
+    const address = order.address || {};
+    const cusName = String(address.name || 'Customer').slice(0, 100);
+    const cusPhone = String(address.phone || '01700000000').slice(0, 20);
+    const cusAdd = String(address.address || 'N/A').slice(0, 200);
+    const cusCity = String(address.city || 'Dhaka').slice(0, 60);
+    const cusEmail = String(order.customerEmail || 'customer@designtub.com').slice(0, 100);
 
+    // tran_id is unique per attempt; it gets bound to this order below so
+    // payment-success.js can verify the callback actually belongs to this
+    // order and hasn't been forged/replayed with a mismatched tran_id.
     const tranId = `DTB-${orderId}-${Date.now()}`;
     const apiUrl = process.env.API_BASE_URL || 'https://dgghhh.vercel.app';
 
@@ -106,19 +121,34 @@ module.exports = async (req, res) => {
       value_a: orderId,
     };
 
-    const params = new URLSearchParams(postData);
-    const sslczResponse = await fetch(`${SSLCZ_BASE}/gwprocess/v4/api.php`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: params.toString(),
-    });
-
-    const sslczData = await sslczResponse.json();
+    let sslczData;
+    try {
+      const params = new URLSearchParams(postData);
+      const sslczResponse = await fetchWithTimeout(`${SSLCZ_BASE}/gwprocess/v4/api.php`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString(),
+      }, 10000);
+      sslczData = await sslczResponse.json();
+    } catch (fErr) {
+      console.error('SSLCommerz request failed/timed out:', fErr.message);
+      return res.status(502).json({ error: 'Payment gateway unreachable, please try again' });
+    }
 
     if (sslczData.status !== 'SUCCESS') {
       console.error('SSLCommerz Error:', sslczData);
-      return res.status(400).json({ error: 'SSLCommerz initiation failed', details: sslczData });
+      return res.status(400).json({ error: 'SSLCommerz initiation failed', details: sslczData.failedreason || sslczData });
     }
+
+    // Bind this tran_id to the order now, BEFORE returning the gateway URL,
+    // so payment-success can later cross-check it. Also record amount so
+    // a tampered client-side total can be caught during validation.
+    await orderRef.set({
+      payment_status: 'Initiated',
+      payment_tran_id: tranId,
+      expected_amount: totalAmount,
+      initiatedAt: new Date().toISOString(),
+    }, { merge: true });
 
     return res.status(200).json({ url: sslczData.GatewayPageURL });
 
@@ -126,5 +156,4 @@ module.exports = async (req, res) => {
     console.error('Fatal initiate-payment Error:', err);
     return res.status(500).json({ error: 'Server Internal Error', message: err.message });
   }
-};  }
 };
