@@ -3,5 +3,11 @@
     "api/*.js": {
       "maxDuration": 25
     }
-  }
+  },
+  "crons": [
+    {
+      "path": "/api/cron-check-pending-payments",
+      "schedule": "*/15 * * * *"
+    }
+  ]
 }
